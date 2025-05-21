@@ -19,12 +19,17 @@
 package org.kie.kogito.addons.k8s.workitems;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.time.temporal.ValueRange;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 import org.kie.api.runtime.process.WorkItem;
 import org.kie.kogito.addons.k8s.Endpoint;
@@ -33,13 +38,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import jakarta.ws.rs.HttpMethod;
-import jakarta.ws.rs.core.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
 
 /**
  * This service is meant to be used with KogitoWorkItemHandlers to call well-known Kogito services deployed in the very same Kubernetes cluster.
@@ -54,15 +52,12 @@ public abstract class AbstractDiscoveredEndpointCaller {
     private static final List<String> INTERNAL_FIELDS = Arrays.asList("TaskName", "ActorId", "GroupId", "Priority", "Comment", "Skippable", "Content", "Model", "Namespace");
 
     private final ObjectMapper objectMapper;
-    private final OkHttpClient httpClient;
+    private final HttpClient httpClient;
 
     public AbstractDiscoveredEndpointCaller(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
-        this.httpClient = new OkHttpClient.Builder()
-                .connectTimeout(60, TimeUnit.SECONDS)
-                .writeTimeout(60, TimeUnit.SECONDS)
-                .readTimeout(60, TimeUnit.SECONDS)
-                .build();
+
+        this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(60)).build();
     }
 
     protected abstract EndpointDiscovery getEndpointDiscovery();
@@ -92,55 +87,50 @@ public abstract class AbstractDiscoveredEndpointCaller {
 
         INTERNAL_FIELDS.forEach(data::remove);
 
-        final Request request = createRequest(String.format("%s/%s", endpoint.get(0).getUrl(), service), createRequestPayload(data), httpMethod);
-        try (Response response = this.httpClient.newCall(request).execute()) {
-            return createResultsFromResponse(response, request.url().toString());
-        } catch (IOException e) {
+        final HttpRequest request = createRequest(String.format("%s/%s", endpoint.get(0).getUrl(), service), createRequestPayload(data), httpMethod);
+        try {
+            return createResultsFromResponse(this.httpClient.send(request, HttpResponse.BodyHandlers.ofString()));
+        } catch (IOException | InterruptedException e) {
             throw new EndpointCallerException(e);
         }
     }
 
-    private RequestBody createRequestPayload(Map<String, Object> data) {
+    private HttpRequest.BodyPublisher createRequestPayload(Map<String, Object> data) {
         if (data == null) {
             return null;
         }
         try {
             final String json = objectMapper.writeValueAsString(data);
             LOGGER.debug("Sending body {}", json);
-            return RequestBody.create(okhttp3.MediaType.parse(MediaType.APPLICATION_JSON), json);
+            return HttpRequest.BodyPublishers.ofString(json);
         } catch (Exception e) {
             throw new EndpointCallerException("Unexpected error when producing request payload", e);
         }
     }
 
-    private Request createRequest(String url, RequestBody body, String httpMethod) {
-        Request.Builder builder;
-        switch (httpMethod) {
-            case HttpMethod.DELETE:
-                builder = new Request.Builder().url(url).delete(body);
-                break;
-            case HttpMethod.POST:
-                builder = new Request.Builder().url(url).post(body);
-                break;
-            case HttpMethod.PUT:
-                builder = new Request.Builder().url(url).put(body);
-                break;
-            default:
-                builder = new Request.Builder().url(url).get();
-                break;
-        }
-        return builder.build();
+    private HttpRequest createRequest(String url, HttpRequest.BodyPublisher body, String httpMethod) {
+        HttpRequest.Builder builder = switch (httpMethod.toUpperCase()) {
+            case "DELETE" -> HttpRequest.newBuilder().uri(URI.create(url)).DELETE();
+            case "POST" -> HttpRequest.newBuilder().uri(URI.create(url)).POST(body).header("Content-Type", "application/json");
+            case "PUT" -> HttpRequest.newBuilder().uri(URI.create(url)).PUT(body).header("Content-Type", "application/json");
+            default -> HttpRequest.newBuilder().uri(URI.create(url));
+        };
+        return builder.timeout(Duration.ofSeconds(60)).build();
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> createResultsFromResponse(final Response response, final String url) throws IOException {
+    private Map<String, Object> createResultsFromResponse(final HttpResponse<String> response) throws IOException {
+        String url = response.uri().toString();
         String payload = "";
+
         if (response.body() != null) {
-            payload = response.body().string();
+            payload = response.body();
         }
-        LOGGER.debug("Response code {} and payload {}", response.code(), payload);
-        if (!response.isSuccessful()) {
-            throw new EndpointCallerException("Unsuccessful response from service (" + url + "). Response: " + response.message() + " (code " + response.code() + ")");
+        LOGGER.debug("Response code {} and payload {}", response.statusCode(), payload);
+
+        // Status codes in the 200's are all successful responses
+        if (!ValueRange.of(200, 299).isValidIntValue(response.statusCode())) {
+            throw new EndpointCallerException("Unsuccessful response from service (%s). Response: %s (code %d)".formatted(url, payload, response.statusCode()));
         }
         return objectMapper.readValue(payload, Map.class);
     }
